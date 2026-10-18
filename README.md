@@ -770,7 +770,26 @@ If `INPUT` is omitted, the script enters guided mode automatically.
 | `--fit {cover,contain,stretch}` | `cover` | Resize strategy before palette conversion |
 | `--rotate {0,90,180,270}` | `0` | Extra rotation after EXIF orientation is normalised |
 | `--background {black,white,yellow,red,blue,green}` | `white` | Fill colour for letterboxing when `--fit contain` is used |
-| `--dither {none,floyd-steinberg,atkinson}` | `atkinson` | Dithering algorithm used during palette reduction |
+| `--dither {none,floyd-steinberg,atkinson,gradient}` | `atkinson` | Dithering algorithm used during palette reduction |
+
+#### Dithering algorithms
+
+| Algorithm | Behaviour |
+|-----------|-----------|
+| `none` | Maps each pixel straight to the nearest palette colour. Fastest, but banding is heavy on photos. |
+| `floyd-steinberg` | Classic error diffusion: spreads 100% of the quantisation error over four neighbours. Smooth tones, but colour bleeds across hard edges. |
+| `atkinson` | Diffuses only 6/8 of the error and discards the rest. Higher contrast and less bleed, which suits the limited palette. |
+| `gradient` | Edge-aware error diffusion. Uses the Floyd-Steinberg kernel, but scales how much error is diffused by the local luma gradient: full diffusion in flat regions for smooth tone, damped near edges so detail stays crisp. A middle ground between the two above. |
+
+#### Gradient dithering options
+
+Only used when `--dither gradient` is selected.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--grad-flat FLOAT` | `1.0` | Fraction of error diffused in flat regions (`0.0`-`1.0`). `1.0` matches Floyd-Steinberg. |
+| `--grad-edge FLOAT` | `0.35` | Fraction of error diffused at edges (`0.0`-`1.0`). Lower is crisper; `0.0` disables diffusion at edges entirely. |
+| `--grad-max FLOAT` | `96.0` | Luma gradient magnitude treated as a full edge. Lower values classify more of the image as edge. |
 
 ### Adjustment options
 

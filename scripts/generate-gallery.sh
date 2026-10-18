@@ -34,7 +34,7 @@ if [ ${#files[@]} -eq 0 ]; then
 fi
 
 PRESETS=("default" "vivid" "graphics" "accurate")
-DITHERS=("floyd-steinberg" "atkinson")
+DITHERS=("floyd-steinberg" "atkinson" "gradient")
 
 total_images=${#files[@]}
 total_presets=${#PRESETS[@]}

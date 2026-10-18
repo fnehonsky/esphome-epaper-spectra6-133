@@ -32,12 +32,22 @@ PALETTE_COLORS = tuple(color for _, color in PALETTE)
 
 # Pre-computed BT.709 luma for each palette entry.
 PALETTE_LUMA = tuple(0.2126 * r + 0.7152 * g + 0.0722 * b for r, g, b in PALETTE_COLORS)
+
 # PNG palettes must contain 256 RGB entries (256 * 3 bytes), so the unused tail
 # is zero-padded after the six panel colors.
 PNG_PALETTE_BYTES = bytes(
     [component for color in PALETTE_COLORS for component in color]
     + [0] * (768 - len(PALETTE_COLORS) * 3)
 )
+
+# Gradient dithering defaults. The fraction of quantization error that gets
+# diffused is interpolated between FLAT (smooth regions) and EDGE (detail) based
+# on the local luma gradient; MAX is the gradient magnitude treated as "fully an
+# edge". Damping diffusion at edges keeps them crisp and stops color bleeding
+# across them, at the cost of discarding the undiffused remainder.
+GRADIENT_FLAT_WEIGHT = 1.0
+GRADIENT_EDGE_WEIGHT = 0.35
+GRADIENT_MAX = 96.0
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -55,6 +65,9 @@ class ConversionOptions:
     height: int = DISPLAY_HEIGHT
     fit: str = "cover"
     dither: str = "atkinson"
+    grad_flat: float = GRADIENT_FLAT_WEIGHT
+    grad_edge: float = GRADIENT_EDGE_WEIGHT
+    grad_max: float = GRADIENT_MAX
     brightness: float = 1.0
     contrast: float = 1.0
     saturation: float = 1.0
@@ -137,6 +150,9 @@ DEFAULT_VALUES: dict[str, object] = {
     "height": DISPLAY_HEIGHT,
     "fit": "cover",
     "dither": "atkinson",
+    "grad_flat": GRADIENT_FLAT_WEIGHT,
+    "grad_edge": GRADIENT_EDGE_WEIGHT,
+    "grad_max": GRADIENT_MAX,
     "brightness": 1.0,
     "contrast": 1.0,
     "saturation": 1.0,
@@ -207,9 +223,39 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--dither",
-        choices=("none", "floyd-steinberg", "atkinson"),
+        choices=("none", "floyd-steinberg", "atkinson", "gradient"),
         default=None,
         help="Dithering algorithm (default: atkinson)",
+    )
+    parser.add_argument(
+        "--grad-flat",
+        dest="grad_flat",
+        type=float,
+        default=None,
+        help=(
+            "Gradient dither: error fraction diffused in flat regions, 0.0-1.0 "
+            f"(default: {GRADIENT_FLAT_WEIGHT})"
+        ),
+    )
+    parser.add_argument(
+        "--grad-edge",
+        dest="grad_edge",
+        type=float,
+        default=None,
+        help=(
+            "Gradient dither: error fraction diffused at edges, 0.0-1.0 "
+            f"(default: {GRADIENT_EDGE_WEIGHT})"
+        ),
+    )
+    parser.add_argument(
+        "--grad-max",
+        dest="grad_max",
+        type=float,
+        default=None,
+        help=(
+            "Gradient dither: luma gradient treated as a full edge "
+            f"(default: {GRADIENT_MAX})"
+        ),
     )
     parser.add_argument(
         "--brightness",
@@ -320,6 +366,9 @@ def build_options_from_args(args: argparse.Namespace) -> ConversionOptions:
         height=int(settings["height"]),
         fit=str(settings["fit"]),
         dither=str(settings["dither"]),
+        grad_flat=float(settings["grad_flat"]),
+        grad_edge=float(settings["grad_edge"]),
+        grad_max=float(settings["grad_max"]),
         brightness=float(settings["brightness"]),
         contrast=float(settings["contrast"]),
         saturation=float(settings["saturation"]),
@@ -349,6 +398,9 @@ def resolve_settings(args: argparse.Namespace) -> dict[str, object]:
         "height",
         "fit",
         "dither",
+        "grad_flat",
+        "grad_edge",
+        "grad_max",
         "brightness",
         "contrast",
         "saturation",
@@ -398,10 +450,21 @@ def validate_options(options: ConversionOptions) -> None:
         errors.append("--sharpness must be greater than zero")
     if options.fit not in ("cover", "contain", "stretch"):
         errors.append(f"--fit must be cover, contain, or stretch (got: {options.fit})")
-    if options.dither not in ("none", "floyd-steinberg", "atkinson"):
+    if options.dither not in ("none", "floyd-steinberg", "atkinson", "gradient"):
         errors.append(
-            f"--dither must be none, floyd-steinberg, or atkinson (got: {options.dither})"
+            "--dither must be none, floyd-steinberg, atkinson, or gradient "
+            f"(got: {options.dither})"
         )
+    if not 0.0 <= options.grad_flat <= 1.0:
+        errors.append(
+            f"--grad-flat must be between 0.0 and 1.0 (got: {options.grad_flat})"
+        )
+    if not 0.0 <= options.grad_edge <= 1.0:
+        errors.append(
+            f"--grad-edge must be between 0.0 and 1.0 (got: {options.grad_edge})"
+        )
+    if options.grad_max <= 0:
+        errors.append(f"--grad-max must be greater than zero (got: {options.grad_max})")
     if options.rotate not in (0, 90, 180, 270):
         errors.append(f"--rotate must be 0, 90, 180, or 270 (got: {options.rotate})")
     if options.background not in PALETTE_NAMES:
@@ -450,7 +513,7 @@ def convert_loaded_image(image, options: ConversionOptions):
 
     image = _apply_enhancements(image, options, ImageEnhance, ImageFilter)
     image = _fit_to_canvas(image, options, Image, ImageOps, lanczos)
-    return _quantize_to_palette(image, options.dither, Image)
+    return _quantize_to_palette(image, options, Image)
 
 
 def save_converted_image(image, output_path: Path) -> None:
@@ -508,16 +571,27 @@ def _fit_to_canvas(image, options: ConversionOptions, Image, ImageOps, lanczos):
 # ---------------------------------------------------------------------------
 
 
-def _quantize_to_palette(image, dither: str, Image):
+def _quantize_to_palette(image, options: ConversionOptions, Image):
     """Reduce an RGB image to the fixed six-color palette as an indexed PNG."""
     width, height = image.size
     src_bytes = image.tobytes()
     dst_indices = bytearray(width * height)
+    dither = options.dither
 
     if dither == "none":
         _map_without_dither(src_bytes, dst_indices)
     elif dither == "floyd-steinberg":
         _dither_floyd_steinberg(src_bytes, dst_indices, width, height)
+    elif dither == "gradient":
+        _dither_gradient(
+            src_bytes,
+            dst_indices,
+            width,
+            height,
+            flat=options.grad_flat,
+            edge=options.grad_edge,
+            grad_max=options.grad_max,
+        )
     else:
         _dither_atkinson(src_bytes, dst_indices, width, height)
 
@@ -736,6 +810,123 @@ def _dither_atkinson(
         cur_b, nxt_b, nxt2_b = nxt_b, nxt2_b, [0.0] * (width + 4)
 
 
+def _dither_gradient(
+    src_bytes: bytes,
+    dst_indices: bytearray,
+    width: int,
+    height: int,
+    flat: float = GRADIENT_FLAT_WEIGHT,
+    edge: float = GRADIENT_EDGE_WEIGHT,
+    grad_max: float = GRADIENT_MAX,
+) -> None:
+    """Edge-aware error diffusion to the six-color palette.
+
+    Uses the Floyd-Steinberg 7/5/3/1 kernel, but scales how much of the error is
+    diffused by the local luma gradient:
+
+        g = |dLuma/dx| + |dLuma/dy|     (L1 norm, no sqrt in the hot loop)
+        w = flat + (edge - flat) * min(g / grad_max, 1.0)
+
+    Flat regions get ``flat`` (1.0 by default, i.e. plain Floyd-Steinberg) for
+    smooth tone reproduction. Near edges the weight falls towards ``edge``,
+    damping diffusion so detail stays crisp and color does not bleed across the
+    boundary. The undiffused remainder is discarded, the same deliberate loss
+    Atkinson relies on, here applied adaptively rather than uniformly.
+
+    The gradient is measured on the *source* luma, not the error-corrected
+    value, so accumulated diffusion error cannot masquerade as an edge.
+
+    Uses two row buffers with width+2 padding, matching the Floyd-Steinberg
+    implementation above.
+    """
+    cur_r = [0.0] * (width + 2)
+    cur_g = [0.0] * (width + 2)
+    cur_b = [0.0] * (width + 2)
+    nxt_r = [0.0] * (width + 2)
+    nxt_g = [0.0] * (width + 2)
+    nxt_b = [0.0] * (width + 2)
+    src_pos = 0
+    out_pos = 0
+    clamp = _clamp
+    nearest_index = _nearest_palette_index
+    palette_colors = PALETTE_COLORS
+    row_stride = width * 3
+    weight_span = edge - flat
+    inv_grad_max = 1.0 / grad_max if grad_max > 0 else 0.0
+    last_x = width - 1
+    last_y = height - 1
+
+    for y in range(height):
+        for x in range(width):
+            sr = src_bytes[src_pos]
+            sg = src_bytes[src_pos + 1]
+            sb = src_bytes[src_pos + 2]
+            luma = 0.2126 * sr + 0.7152 * sg + 0.0722 * sb
+
+            # Forward differences against the right and lower neighbors. The
+            # final column and row have no neighbor, so they count as flat.
+            if x < last_x:
+                nx = src_pos + 3
+                gx = abs(
+                    0.2126 * src_bytes[nx]
+                    + 0.7152 * src_bytes[nx + 1]
+                    + 0.0722 * src_bytes[nx + 2]
+                    - luma
+                )
+            else:
+                gx = 0.0
+            if y < last_y:
+                ny = src_pos + row_stride
+                gy = abs(
+                    0.2126 * src_bytes[ny]
+                    + 0.7152 * src_bytes[ny + 1]
+                    + 0.0722 * src_bytes[ny + 2]
+                    - luma
+                )
+            else:
+                gy = 0.0
+
+            src_pos += 3
+
+            t = (gx + gy) * inv_grad_max
+            t = min(t, 1.0)
+            weight = flat + weight_span * t
+
+            idx = x + 1
+            rv = clamp(sr + cur_r[idx])
+            gv = clamp(sg + cur_g[idx])
+            bv = clamp(sb + cur_b[idx])
+
+            palette_idx = nearest_index(rv, gv, bv)
+            pr, pg, pb = palette_colors[palette_idx]
+            dst_indices[out_pos] = palette_idx
+            out_pos += 1
+
+            er = (rv - pr) * weight
+            eg = (gv - pg) * weight
+            eb = (bv - pb) * weight
+
+            cur_r[idx + 1] += er * (7.0 / 16.0)
+            cur_g[idx + 1] += eg * (7.0 / 16.0)
+            cur_b[idx + 1] += eb * (7.0 / 16.0)
+
+            nxt_r[idx - 1] += er * (3.0 / 16.0)
+            nxt_g[idx - 1] += eg * (3.0 / 16.0)
+            nxt_b[idx - 1] += eb * (3.0 / 16.0)
+
+            nxt_r[idx] += er * (5.0 / 16.0)
+            nxt_g[idx] += eg * (5.0 / 16.0)
+            nxt_b[idx] += eb * (5.0 / 16.0)
+
+            nxt_r[idx + 1] += er * (1.0 / 16.0)
+            nxt_g[idx + 1] += eg * (1.0 / 16.0)
+            nxt_b[idx + 1] += eb * (1.0 / 16.0)
+
+        cur_r, nxt_r = nxt_r, [0.0] * (width + 2)
+        cur_g, nxt_g = nxt_g, [0.0] * (width + 2)
+        cur_b, nxt_b = nxt_b, [0.0] * (width + 2)
+
+
 def _clamp(value: float) -> int:
     """Clamp a float to the 0-255 integer range."""
     if not math.isfinite(value):
@@ -782,6 +973,13 @@ def _build_filename_slug(options: ConversionOptions) -> str:
     """
     tokens: list[str] = [options.preset, options.fit, _short_dither(options.dither)]
 
+    if options.dither == "gradient":
+        if options.grad_flat != GRADIENT_FLAT_WEIGHT:
+            tokens.append(f"gf{_fmt100(options.grad_flat)}")
+        if options.grad_edge != GRADIENT_EDGE_WEIGHT:
+            tokens.append(f"ge{_fmt100(options.grad_edge)}")
+        if options.grad_max != GRADIENT_MAX:
+            tokens.append(f"gm{options.grad_max:g}")
     if options.brightness != 1.0:
         tokens.append(f"b{_fmt100(options.brightness)}")
     if options.contrast != 1.0:
@@ -808,7 +1006,12 @@ def _build_filename_slug(options: ConversionOptions) -> str:
 
 def _short_dither(dither: str) -> str:
     """Abbreviate dither mode for filenames."""
-    return {"none": "none", "floyd-steinberg": "fs", "atkinson": "atkinson"}[dither]
+    return {
+        "none": "none",
+        "floyd-steinberg": "fs",
+        "atkinson": "atkinson",
+        "gradient": "grad",
+    }[dither]
 
 
 def _fmt100(value: float) -> str:
@@ -838,31 +1041,61 @@ def guided_mode(args: argparse.Namespace) -> ConversionOptions:
         preset = PRESETS_BY_NAME[preset_name]
         settings.update(preset.values)
 
+    # Prompts are issued in the order written here, so each answer is bound to a
+    # local before the options object is assembled.
+    width = _prompt_int("Width", int(settings["width"]))
+    height = _prompt_int("Height", int(settings["height"]))
+    fit = _prompt_choice(
+        "Fit mode", ("cover", "contain", "stretch"), str(settings["fit"])
+    )
+    dither = _prompt_choice(
+        "Dither",
+        ("none", "floyd-steinberg", "atkinson", "gradient"),
+        str(settings["dither"]),
+    )
+
+    grad_flat = float(settings["grad_flat"])
+    grad_edge = float(settings["grad_edge"])
+    grad_max = float(settings["grad_max"])
+    if dither == "gradient":
+        grad_flat = _prompt_float("Gradient flat weight", grad_flat, minimum=0.0)
+        grad_edge = _prompt_float("Gradient edge weight", grad_edge, minimum=0.0)
+        grad_max = _prompt_float("Gradient max", grad_max)
+
+    brightness = _prompt_float("Brightness", float(settings["brightness"]))
+    contrast = _prompt_float("Contrast", float(settings["contrast"]))
+    saturation = _prompt_float("Saturation", float(settings["saturation"]))
+    sharpness = _prompt_float("Sharpness", float(settings["sharpness"]))
+    rotate = _prompt_choice(
+        "Rotate", ("0", "90", "180", "270"), str(int(settings["rotate"])), cast=int
+    )
+    background = _prompt_choice(
+        "Background", PALETTE_NAMES, str(settings["background"])
+    )
+    edge_enhance = _prompt_bool("Edge enhance", bool(settings["edge_enhance"]))
+    smooth = _prompt_bool("Smooth", bool(settings["smooth"]))
+    filter_sharpen = _prompt_bool("Filter sharpen", bool(settings["filter_sharpen"]))
+
     options = ConversionOptions(
         input_path=Path(input_value).expanduser().resolve(),
         output_path=Path(input_value).expanduser().resolve(),
         preset=preset_name,
-        width=_prompt_int("Width", int(settings["width"])),
-        height=_prompt_int("Height", int(settings["height"])),
-        fit=_prompt_choice(
-            "Fit mode", ("cover", "contain", "stretch"), str(settings["fit"])
-        ),
-        dither=_prompt_choice(
-            "Dither", ("none", "floyd-steinberg", "atkinson"), str(settings["dither"])
-        ),
-        brightness=_prompt_float("Brightness", float(settings["brightness"])),
-        contrast=_prompt_float("Contrast", float(settings["contrast"])),
-        saturation=_prompt_float("Saturation", float(settings["saturation"])),
-        sharpness=_prompt_float("Sharpness", float(settings["sharpness"])),
-        rotate=_prompt_choice(
-            "Rotate", ("0", "90", "180", "270"), str(int(settings["rotate"])), cast=int
-        ),
-        background=_prompt_choice(
-            "Background", PALETTE_NAMES, str(settings["background"])
-        ),
-        edge_enhance=_prompt_bool("Edge enhance", bool(settings["edge_enhance"])),
-        smooth=_prompt_bool("Smooth", bool(settings["smooth"])),
-        filter_sharpen=_prompt_bool("Filter sharpen", bool(settings["filter_sharpen"])),
+        width=width,
+        height=height,
+        fit=fit,
+        dither=dither,
+        grad_flat=grad_flat,
+        grad_edge=grad_edge,
+        grad_max=grad_max,
+        brightness=brightness,
+        contrast=contrast,
+        saturation=saturation,
+        sharpness=sharpness,
+        rotate=rotate,
+        background=background,
+        edge_enhance=edge_enhance,
+        smooth=smooth,
+        filter_sharpen=filter_sharpen,
     )
 
     output_default = str(resolve_output_path(options, args.output_flag or args.output))
@@ -907,7 +1140,13 @@ def _prompt_int(label: str, default: int) -> int:
         return value
 
 
-def _prompt_float(label: str, default: float) -> float:
+def _prompt_float(label: str, default: float, minimum: float | None = None) -> float:
+    """Prompt for a float.
+
+    Values must be greater than zero unless ``minimum`` is given, in which case
+    the value must be at least ``minimum``. The gradient weights accept 0.0,
+    which switches error diffusion off entirely.
+    """
     while True:
         raw = _prompt_text(label, str(default))
         try:
@@ -915,8 +1154,12 @@ def _prompt_float(label: str, default: float) -> float:
         except ValueError:
             print("  Please enter a valid number.")
             continue
-        if value <= 0:
-            print("  Value must be greater than zero.")
+        if minimum is None:
+            if value <= 0:
+                print("  Value must be greater than zero.")
+                continue
+        elif value < minimum:
+            print(f"  Value must be at least {minimum:g}.")
             continue
         return value
 
@@ -960,6 +1203,11 @@ def print_summary(options: ConversionOptions) -> None:
     print(f"  canvas:     {options.width}\u00d7{options.height}")
     print(f"  fit:        {options.fit}")
     print(f"  dither:     {options.dither}")
+    if options.dither == "gradient":
+        print(
+            f"  gradient:   flat {options.grad_flat:g}, edge {options.grad_edge:g}, "
+            f"max {options.grad_max:g}"
+        )
     print(f"  filters:    {filters}")
     print("  palette:    black, white, yellow, red, blue, green")
     print()
