@@ -787,9 +787,33 @@ Only used when `--dither gradient` is selected.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--grad-flat FLOAT` | `1.0` | Fraction of error diffused in flat regions (`0.0`-`1.0`). `1.0` matches Floyd-Steinberg. |
+| `--grad-flat FLOAT` | `1.0` | Fraction of error diffused in flat regions (`0.0`-`1.0`). `1.0` matches Floyd-Steinberg. Values below `0.9` risk periodic artefacts -- see below. |
 | `--grad-edge FLOAT` | `0.35` | Fraction of error diffused at edges (`0.0`-`1.0`). Lower is crisper; `0.0` disables diffusion at edges entirely. |
 | `--grad-max FLOAT` | `96.0` | Luma gradient magnitude treated as a full edge. Lower values classify more of the image as edge. |
+
+> [!WARNING]
+> **Keep `--grad-flat` at or above `0.9`.** Damping works by scaling the
+> Floyd-Steinberg kernel, which shortens how long diffused error survives. Below
+> about `0.9` the error buffer stops wandering and settles into a repeating
+> orbit, which appears as a visible weave or plaid across smooth areas such as
+> sky. Lowering it also darkens the image, because discarded error is never
+> represented anywhere.
+>
+> Measured on a photographic sky, where higher periodicity means a more visible
+> repeating pattern and bias is the red-channel drift from the true colour:
+>
+> | `--grad-flat` | periodicity | colour bias |
+> |---------------|-------------|-------------|
+> | `1.0` (default) | 57% | -0.6 |
+> | `0.9` | 66% | -7.2 |
+> | `0.8` | 74% | -14.7 |
+> | `0.72` | 76% | -25.2 |
+>
+> For reference, `atkinson` scores 66% periodicity and -22.3 bias on the same
+> image. At `0.72` the gradient ditherer is worse than `atkinson` on both counts,
+> so there is nothing to gain down there -- if you want the `atkinson` look, use
+> `atkinson`. The value of `gradient` is Floyd-Steinberg's tonal accuracy with
+> crisper edges, which is what the default `1.0` gives you.
 
 ### Adjustment options
 

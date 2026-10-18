@@ -5,6 +5,9 @@ configs/.esphome/
 # Gallery generated images
 /configs/images/gallery/
 
+# Local dithering test images (originals exceed the large-file hook limit)
+/tests/test_pictures/
+
 # Secrets (never commit)
 /configs/secrets.yaml
 

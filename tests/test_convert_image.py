@@ -247,6 +247,66 @@ class GradientDitherTests(unittest.TestCase):
         self.assertTrue(all(0 <= i < len(convert_image.PALETTE_COLORS) for i in result))
 
 
+class GradientFlatRegionTests(unittest.TestCase):
+    """Guards against periodic lock-in in smooth areas.
+
+    Damping scales Floyd-Steinberg's compact 4-neighbour kernel, which shortens
+    how long diffused error survives. Push the flat-region weight low enough and
+    the error buffer stops wandering and settles into a repeating orbit, which
+    shows up as a visible weave or plaid across smooth sky. The shipped default
+    of 1.0 diffuses the full error in flat regions and does not lock in; these
+    tests exist so a future default cannot quietly wander into the bad range.
+    """
+
+    PERIODIC_LIMIT = 0.45
+
+    @staticmethod
+    def _periodicity(indices, width: int, height: int) -> float:
+        """Strongest small-period 2-D tile match. 1.0 is a perfect lattice."""
+        best = 0.0
+        for py in range(1, 7):
+            for px in range(1, 7):
+                if px == 1 and py == 1:
+                    continue
+                total = hit = 0
+                for y in range(height - py):
+                    base = y * width
+                    shifted = (y + py) * width
+                    for x in range(width - px):
+                        total += 1
+                        if indices[base + x] == indices[shifted + x + px]:
+                            hit += 1
+                if total and hit / total > best:
+                    best = hit / total
+        return best
+
+    def test_default_weights_do_not_lock_into_a_pattern(self) -> None:
+        width, height = 48, 48
+        src = _solid(width, height, (70, 110, 180))
+
+        result = _dither(
+            src,
+            width,
+            height,
+            flat=convert_image.GRADIENT_FLAT_WEIGHT,
+            edge=convert_image.GRADIENT_EDGE_WEIGHT,
+            grad_max=convert_image.GRADIENT_MAX,
+        )
+
+        self.assertLess(self._periodicity(result, width, height), self.PERIODIC_LIMIT)
+
+    def test_the_metric_detects_a_heavily_damped_flat_weight(self) -> None:
+        """Proves the guard above can actually fail; 0.6 is a known-bad weight."""
+        width, height = 48, 48
+        src = _solid(width, height, (70, 110, 180))
+
+        result = _dither(src, width, height, flat=0.6, edge=0.3, grad_max=64.0)
+
+        self.assertGreater(
+            self._periodicity(result, width, height), self.PERIODIC_LIMIT
+        )
+
+
 class GradientOptionPlumbingTests(unittest.TestCase):
     """The three gradient knobs travel from CLI flags through to options."""
 
